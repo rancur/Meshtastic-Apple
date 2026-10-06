@@ -939,9 +939,13 @@ struct MeshMapMK: View {
 	}
 
 	private func refreshMapWindowOpenState() {
-		// One primary app window plus one detached window means > 1 attached scenes.
-		let attachedScenes = UIApplication.shared.connectedScenes.filter { $0.activationState != .unattached }
-		isMapWindowOpen = attachedScenes.count > 1
+		// One primary app window plus one detached window means > 1 attached window scenes.
+		// A CarPlay dashboard is a connected scene too, and counting it hid this button
+		// whenever the phone was on CarPlay, so only app windows count.
+		let attachedWindows = UIApplication.shared.connectedScenes.filter {
+			$0.session.role == .windowApplication && $0.activationState != .unattached
+		}
+		isMapWindowOpen = attachedWindows.count > 1
 	}
 
 	/// Quantized camera key so `.onChange` can react to pan/zoom settles even though

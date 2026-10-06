@@ -37,9 +37,12 @@ struct MapWindow: View {
 			if routerToken == nil {
 				routerToken = appState.sceneRouters.register(router)
 			}
-			// If the map window is restored on launch without the main window, dismiss it
+			// If the map window is restored on launch without the main window, dismiss it.
+			// CarPlay is not a main window, so it does not keep this one open.
 			let mainScenes = UIApplication.shared.connectedScenes.filter {
-				$0.session.configuration.name != "meshmap-window" && $0.activationState != .unattached
+				$0.session.role == .windowApplication
+					&& $0.session.configuration.name != "meshmap-window"
+					&& $0.activationState != .unattached
 			}
 			if mainScenes.isEmpty {
 				dismissWindow(id: "meshmap-window")
@@ -51,9 +54,12 @@ struct MapWindow: View {
 			self.routerToken = nil
 		}
 		.onReceive(NotificationCenter.default.publisher(for: UIScene.didDisconnectNotification)) { _ in
-			// Close the map window when the main window is closed
-			let remainingScenes = UIApplication.shared.connectedScenes.filter { $0.activationState != .unattached }
-			if remainingScenes.count <= 1 {
+			// Close the map window when the main window is closed. Only app windows count:
+			// a CarPlay scene would otherwise leave this window open on its own.
+			let remainingWindows = UIApplication.shared.connectedScenes.filter {
+				$0.session.role == .windowApplication && $0.activationState != .unattached
+			}
+			if remainingWindows.count <= 1 {
 				dismissWindow(id: "meshmap-window")
 			}
 		}
