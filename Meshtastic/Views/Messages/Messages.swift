@@ -14,6 +14,7 @@ struct Messages: View {
 
 	@Environment(\.modelContext) private var context
 	@Environment(\.colorScheme) private var colorScheme
+	@Environment(\.horizontalSizeClass) private var horizontalSizeClass
 	@ObservedObject	var router: Router
 	@Binding var unreadChannelMessages: Int
 	@Binding var unreadDirectMessages: Int
@@ -26,6 +27,11 @@ struct Messages: View {
 	@State private var channelSelection: ChannelEntity? // Nothing selected by default.
 
 	@State private var columnVisibility = NavigationSplitViewVisibility.all
+	/// What the single stack shows on a phone at regular width. See `prefersStackOverOverlaySidebar`.
+	@State private var stackPath = NavigationPath()
+	/// The last path the stack was given from the selection, so a change made here is not
+	/// mistaken for the person going back.
+	@State private var syncedStackPath = NavigationPath()
 
 	/// Resolves the connected node from the current context on each access. Never cached, so it
 	/// can't outlive a container recreation. `getNodeInfo` is a `try?` fetch and returns nil if
@@ -62,80 +68,164 @@ struct Messages: View {
 		)
 	}
 
+	/// The open iPhone Duo display is regular width but only about 669pt across. That is
+	/// not enough for three columns, so `NavigationSplitView` draws the sidebar and the
+	/// channel or contact list as overlays on top of the conversation, and with
+	/// `columnVisibility` forced to `.all` they cover its navigation bar — taking the back
+	/// button of a node pushed from a message with them. This is the layout the node list
+	/// had before it moved to a stack in the same case.
+	///
+	/// A phone-idiom device never has room for the columns, so at this width it gets the
+	/// same single stack it gets folded. Compact width still goes through the split view,
+	/// which collapses to a stack on its own and is the path every iPhone already takes.
+	/// iPad and Mac are untouched.
+	private var prefersStackOverOverlaySidebar: Bool {
+		horizontalSizeClass == .regular && UIDevice.current.userInterfaceIdiom == .phone
+	}
+
+	/// The stack the current selection stands for: the section, then the open conversation.
+	///
+	/// The section and the selected channel or contact stay the source of truth in both
+	/// layouts, so deep links, notification taps and `popToRoot` move the stack exactly as
+	/// they move the split view, and opening or closing the device keeps the conversation.
+	///
+	/// Only the conversation that belongs to the section counts. `route(url:)` moves the
+	/// section before this view consumes the link, and for that moment the other section's
+	/// conversation is still selected; pushing it would open the wrong thread.
+	private var selectionPath: NavigationPath {
+		var path = NavigationPath()
+		guard let section = router.messagesSection else { return path }
+		path.append(section)
+		switch section {
+		case .channels:
+			if let channelSelection {
+				path.append(channelSelection)
+			}
+		case .directMessages:
+			if let userSelection {
+				path.append(userSelection)
+			}
+		}
+		return path
+	}
+
 	var body: some View {
+		Group {
+			if prefersStackOverOverlaySidebar {
+				messagesStack
+			} else {
+				messagesSplitView
+			}
+		}
+		.onAppear {
+			// Handles the deep link set by `route(url:)` before this view began observing.
+			consumeDeepLink(router.messagesState)
+			revealSidebarForEmptySelection()
+		}.onChange(of: router.messagesState) { _, newValue in
+			consumeDeepLink(newValue)
+		}.onChange(of: router.messagesSection) { _, newValue in
+			// A reset (e.g. `popToRoot` on disconnect) nils the section; clear the detail pane to
+			// match. Section *changes* between .channels/.directMessages are reset by the sidebar
+			// setter and by `consumeDeepLink`, so only the nil case needs handling here.
+			if newValue == nil {
+				channelSelection = nil
+				userSelection = nil
+				revealSidebarForEmptySelection()
+			}
+		}.onChange(of: prefersStackOverOverlaySidebar) { _, prefersStack in
+			// Start the next stack from the selection, not from whatever it held when the
+			// device last closed. The stack's own handlers are gone by now, so this clears
+			// nothing else.
+			if !prefersStack {
+				stackPath = NavigationPath()
+				syncedStackPath = NavigationPath()
+			}
+		}
+	}
+
+	// MARK: - Stack
+
+	private var messagesStack: some View {
+		NavigationStack(path: $stackPath) {
+			sidebar
+				// The rows here and in the channel and contact lists are `NavigationLink(value:)`,
+				// which the split view turns into a selection. In a stack they push, so each value
+				// needs a destination, and each destination reports the selection it opened.
+				.navigationDestination(for: MessagesNavigationState.self) { section in
+					sectionList(section)
+						.onAppear {
+							guard router.messagesSection != section else { return }
+							router.messagesSection = section
+							channelSelection = nil
+							userSelection = nil
+						}
+				}
+				.navigationDestination(for: ChannelEntity.self) { channel in
+					Group {
+						if let myInfo = node?.myInfo {
+							ChannelMessageList(myInfo: myInfo, channel: channel)
+								.trackScreen(.channelMessages)
+						}
+					}
+					.onAppear {
+						channelSelection = channel
+						userSelection = nil
+					}
+				}
+				.navigationDestination(for: UserEntity.self) { user in
+					UserMessageList(user: user)
+						.trackScreen(.directMessages)
+						.onAppear {
+							userSelection = user
+							channelSelection = nil
+						}
+				}
+				.navigationDestination(for: Int64.self) { nodeNum in
+					nodeDetail(nodeNum)
+				}
+		}
+		.onAppear {
+			// Empty only on the first appearance after the device opens. Any other time it
+			// holds what the person navigated to, which a tab switch should not undo.
+			guard stackPath.isEmpty else { return }
+			var transaction = Transaction()
+			transaction.disablesAnimations = true
+			withTransaction(transaction) {
+				syncStackToSelection(selectionPath)
+			}
+		}
+		.onChange(of: selectionPath) { _, newPath in
+			// A deep link, a notification tap or a reset changed the selection.
+			syncStackToSelection(newPath)
+		}
+		.onChange(of: stackPath) { _, path in
+			// Back is the one move the destinations above don't report. A path this view
+			// set from the selection already matches it.
+			guard path != syncedStackPath else { return }
+			if path.count < 2 {
+				channelSelection = nil
+				userSelection = nil
+			}
+			if path.isEmpty && router.messagesSection != nil {
+				router.messagesSection = nil
+			}
+		}
+	}
+
+	private func syncStackToSelection(_ path: NavigationPath) {
+		syncedStackPath = path
+		if stackPath != path {
+			stackPath = path
+		}
+	}
+
+	// MARK: - Split View
+
+	private var messagesSplitView: some View {
 		NavigationSplitView(columnVisibility: $columnVisibility) {
-			List(selection: sidebarSelection) {
-				NavigationLink(value: MessagesNavigationState.channels()) {
-					Spacer()
-					Label {
-						Text("Channels")
-							.badge(unreadChannelMessages)
-							.font(.title2)
-							.padding()
-					} icon: {
-						Image(systemName: "person.2")
-							.symbolRenderingMode(.hierarchical)
-							.foregroundColor(.accentColor)
-							.font(.title2)
-							.padding()
-					}
-				}
-				.alignmentGuide(.listRowSeparatorLeading) {
-					$0[.leading]
-				}
-				.accessibilityElement(children: .combine)
-				.accessibilityLabel(unreadChannelMessages > 0
-					? String(localized: "Channels, \(unreadChannelMessages) unread", comment: "VoiceOver: Channels section with unread message count")
-					: String(localized: "Channels", comment: "VoiceOver: Channels section"))
-				NavigationLink(value: MessagesNavigationState.directMessages()) {
-					Spacer()
-					Label {
-						Text("Direct Messages")
-							.badge(unreadDirectMessages)
-							.font(.title2)
-							.padding()
-					} icon: {
-						Image(systemName: "person")
-							.symbolRenderingMode(.hierarchical)
-							.foregroundColor(.accentColor)
-							.font(.title2)
-							.padding()
-					}
-				}
-				.alignmentGuide(.listRowSeparatorLeading) {
-					$0[.leading]
-				}
-				.accessibilityElement(children: .combine)
-				.accessibilityLabel(unreadDirectMessages > 0
-					? String(localized: "Direct Messages, \(unreadDirectMessages) unread", comment: "VoiceOver: Direct Messages section with unread message count")
-					: String(localized: "Direct Messages", comment: "VoiceOver: Direct Messages section"))
-				Spacer()
-				TipView(MessagesTip(), arrowEdge: .top)
-					.tipViewStyle(PersistentTipStyle())
-					.listRowSeparator(.hidden)
-				Spacer()
-					.listRowSeparator(.hidden)
-			}
-			.listStyle(.plain)
-			.navigationTitle("Messages")
-			.navigationBarTitleDisplayMode(.large)
-			.toolbar {
-				ToolbarItem(placement: .topBarLeading) {
-					MeshtasticLogo()
-				}
-			}
+			sidebar
 		} content: {
-			switch router.messagesSection {
-			case .channels:
-				ChannelList(node: nodeBinding, channelSelection: $channelSelection)
-					// Removed navigationTitle and navigationBarTitleDisplayMode here.
-					// ChannelList.swift now handles this within its own NavigationStack.
-			case .directMessages:
-				UserList(node: nodeBinding, userSelection: $userSelection)
-					// Removed navigationTitle here. UserList will handle this.
-			case nil:
-				Text("Select a conversation type")
-			}
+			sectionList(router.messagesSection)
 		} detail: {
 			NavigationStack {
 				Group {
@@ -152,29 +242,98 @@ struct Messages: View {
 					}
 				}
 				.navigationDestination(for: Int64.self) { nodeNum in
-					if let node = getNodeInfo(id: nodeNum, context: context) {
-						NodeDetail(node: node, nodeNum: nodeNum)
-							.trackScreen(.nodeDetail)
-					}
+					nodeDetail(nodeNum)
 				}
 			}
 		}
 		.navigationSplitViewStyle(.balanced)
-		.onAppear {
-			// Handles the deep link set by `route(url:)` before this view began observing.
-			consumeDeepLink(router.messagesState)
-			revealSidebarForEmptySelection()
-		}.onChange(of: router.messagesState) { _, newValue in
-			consumeDeepLink(newValue)
-		}.onChange(of: router.messagesSection) { _, newValue in
-			// A reset (e.g. `popToRoot` on disconnect) nils the section; clear the detail pane to
-			// match. Section *changes* between .channels/.directMessages are reset by the sidebar
-			// setter and by `consumeDeepLink`, so only the nil case needs handling here.
-			if newValue == nil {
-				channelSelection = nil
-				userSelection = nil
-				revealSidebarForEmptySelection()
+	}
+
+	// MARK: - Columns
+
+	private var sidebar: some View {
+		List(selection: sidebarSelection) {
+			NavigationLink(value: MessagesNavigationState.channels()) {
+				Spacer()
+				Label {
+					Text("Channels")
+						.badge(unreadChannelMessages)
+						.font(.title2)
+						.padding()
+				} icon: {
+					Image(systemName: "person.2")
+						.symbolRenderingMode(.hierarchical)
+						.foregroundColor(.accentColor)
+						.font(.title2)
+						.padding()
+				}
 			}
+			.alignmentGuide(.listRowSeparatorLeading) {
+				$0[.leading]
+			}
+			.accessibilityElement(children: .combine)
+			.accessibilityLabel(unreadChannelMessages > 0
+				? String(localized: "Channels, \(unreadChannelMessages) unread", comment: "VoiceOver: Channels section with unread message count")
+				: String(localized: "Channels", comment: "VoiceOver: Channels section"))
+			NavigationLink(value: MessagesNavigationState.directMessages()) {
+				Spacer()
+				Label {
+					Text("Direct Messages")
+						.badge(unreadDirectMessages)
+						.font(.title2)
+						.padding()
+				} icon: {
+					Image(systemName: "person")
+						.symbolRenderingMode(.hierarchical)
+						.foregroundColor(.accentColor)
+						.font(.title2)
+						.padding()
+				}
+			}
+			.alignmentGuide(.listRowSeparatorLeading) {
+				$0[.leading]
+			}
+			.accessibilityElement(children: .combine)
+			.accessibilityLabel(unreadDirectMessages > 0
+				? String(localized: "Direct Messages, \(unreadDirectMessages) unread", comment: "VoiceOver: Direct Messages section with unread message count")
+				: String(localized: "Direct Messages", comment: "VoiceOver: Direct Messages section"))
+			Spacer()
+			TipView(MessagesTip(), arrowEdge: .top)
+				.tipViewStyle(PersistentTipStyle())
+				.listRowSeparator(.hidden)
+			Spacer()
+				.listRowSeparator(.hidden)
+		}
+		.listStyle(.plain)
+		.navigationTitle("Messages")
+		.navigationBarTitleDisplayMode(.large)
+		.toolbar {
+			ToolbarItem(placement: .topBarLeading) {
+				MeshtasticLogo()
+			}
+		}
+	}
+
+	@ViewBuilder
+	private func sectionList(_ section: MessagesNavigationState?) -> some View {
+		switch section {
+		case .channels:
+			ChannelList(node: nodeBinding, channelSelection: $channelSelection)
+				// Removed navigationTitle and navigationBarTitleDisplayMode here.
+				// ChannelList.swift now handles this within its own NavigationStack.
+		case .directMessages:
+			UserList(node: nodeBinding, userSelection: $userSelection)
+				// Removed navigationTitle here. UserList will handle this.
+		case nil:
+			Text("Select a conversation type")
+		}
+	}
+
+	@ViewBuilder
+	private func nodeDetail(_ nodeNum: Int64) -> some View {
+		if let node = getNodeInfo(id: nodeNum, context: context) {
+			NodeDetail(node: node, nodeNum: nodeNum)
+				.trackScreen(.nodeDetail)
 		}
 	}
 
