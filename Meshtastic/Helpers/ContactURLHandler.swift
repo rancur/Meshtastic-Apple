@@ -47,10 +47,7 @@ struct ContactURLHandler {
 				style: .cancel,
 				handler: nil
 			))
-			if let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
-			   let rootViewController = windowScene.windows.first?.rootViewController {
-				rootViewController.present(alertController, animated: true)
-			}
+			presentingViewController()?.present(alertController, animated: true)
 			Logger.services.debug("User Alerted that a firmware upgrade is required to import contacts.")
 			return nil
 		}
@@ -72,8 +69,7 @@ struct ContactURLHandler {
 
 	@MainActor
 	private static func presentInvalidContactAlert() {
-		guard let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
-			  let rootViewController = windowScene.windows.first?.rootViewController else {
+		guard let rootViewController = presentingViewController() else {
 			return
 		}
 		let errorAlert = UIAlertController(
@@ -83,5 +79,16 @@ struct ContactURLHandler {
 		)
 		errorAlert.addAction(UIAlertAction(title: "OK", style: .default))
 		rootViewController.present(errorAlert, animated: true)
+	}
+
+	/// The window to show an alert in. `connectedScenes` is a set, so its `first` can be a
+	/// window in the background, the mesh map window, or the CarPlay scene, which is not a
+	/// window scene at all, and the alert went nowhere. Prefer the window in front.
+	@MainActor
+	private static func presentingViewController() -> UIViewController? {
+		let windowScenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+		let scene = windowScenes.first { $0.activationState == .foregroundActive } ?? windowScenes.first
+		let window = scene?.windows.first { $0.isKeyWindow } ?? scene?.windows.first
+		return window?.rootViewController
 	}
 }
